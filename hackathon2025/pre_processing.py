@@ -46,12 +46,9 @@ class AstroDFDataset(Dataset):
 
 
 if __name__ == "__main__":
-
-    checkpoint_path = "hackathon2025/checkpoints/astroclip_spectrum_pretrained.ckpt"
-    dataset_path = "hackathon2025/data/astroclip_dataset/"
     splits = {
     'train_batch_1': 'data/train_batch_1-00000-of-00001.parquet',}
-    df = pd.read_parquet(dataset_path + splits['train_batch_1'])
+    df = pd.read_parquet("hf://datasets/msiudek/astroPT_euclid_desi_dataset/" + splits['train_batch_1'])
 
     transform = T.Compose([
     T.Resize((256, 256)),  # H x W
@@ -70,7 +67,7 @@ if __name__ == "__main__":
     batch = next(iter(dloader))
 
     model = AstroClipModel.load_from_checkpoint(
-        checkpoint_path=checkpoint_path,
+        checkpoint_path="C:\\Users\\apo\\Bureau\\hackathon2025\\AstroCLIP\\hackathon2025\\data\\astroclip.ckpt"
     ).eval().cuda()
 
     with torch.no_grad():
