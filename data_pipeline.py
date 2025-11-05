@@ -29,6 +29,19 @@ CACHE_DIR = ROOT_DIR / "hackathon2025" / ".cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def zscore_image_tensor(image_tensor: torch.Tensor) -> torch.Tensor:
+    if image_tensor.ndim not in {3, 4}:
+        raise ValueError(f"Image tensor attendu de dimension 3 ou 4, reçu {image_tensor.shape}")
+    if image_tensor.ndim == 4:
+        # Traite un batch complet
+        mean = image_tensor.mean(dim=(2, 3), keepdim=True)
+        std = image_tensor.std(dim=(2, 3), keepdim=True, unbiased=False).clamp(min=1e-6)
+        return (image_tensor - mean) / std
+    mean = image_tensor.mean(dim=(1, 2), keepdim=True)
+    std = image_tensor.std(dim=(1, 2), keepdim=True, unbiased=False).clamp(min=1e-6)
+    return (image_tensor - mean) / std
+
+
 def _cache_path(prefix: str, **kwargs: Any) -> Path:
     """Return a deterministic cache file path based on keyword arguments."""
     payload = json.dumps(kwargs, sort_keys=True, default=str).encode("utf-8")
@@ -113,9 +126,12 @@ def batch_to_records(batch: Dict[str, Any]) -> List[Dict[str, Any]]:
 
         target_value = int(target_batch[idx]) if target_batch is not None else -1
 
+        image_tensor = batch["image"][idx].float()
+        image_tensor = zscore_image_tensor(image_tensor).cpu()
+
         records.append(
             {
-                "image": batch["image"][idx].float().cpu(),
+                "image": image_tensor,
                 "redshift": float(batch["redshift"][idx]),
                 "targetid": target_value,
                 "spectrum": {"flux": flux, "wavelength": wavelength},
@@ -177,7 +193,9 @@ class ParquetDataSource(DataSource):
 
         if "image" not in df.columns:
             df["image"] = df["RGB_image"].apply(
-                lambda blob: transform(Image.open(io.BytesIO(blob["bytes"])).convert("RGB"))
+                lambda blob: zscore_image_tensor(
+                    transform(Image.open(io.BytesIO(blob["bytes"])).convert("RGB"))
+                )
             )
 
         if "redshift" not in df.columns:
@@ -279,9 +297,10 @@ class AstroClipPairDataset(Dataset):
 
         image_tensor = row["image"]
         if isinstance(image_tensor, torch.Tensor):
-            img_tensor = image_tensor
+            img_tensor = image_tensor.detach().clone().float()
         else:
-            img_tensor = torch.tensor(image_tensor)
+            img_tensor = torch.as_tensor(image_tensor, dtype=torch.float32)
+        img_tensor = zscore_image_tensor(img_tensor)
 
         redshift = torch.tensor(row["redshift"], dtype=torch.float32)
 
