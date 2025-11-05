@@ -49,9 +49,10 @@ if __name__ == "__main__":
     splits = {
     'train_batch_1': 'data/train_batch_1-00000-of-00001.parquet',}
     df = pd.read_parquet("hf://datasets/msiudek/astroPT_euclid_desi_dataset/" + splits['train_batch_1'])
+    print(df.columns)
 
     transform = T.Compose([
-    T.Resize((256, 256)),  # H x W
+    T.Resize((144, 144)),  # H x W
     T.ToTensor(),           
     ])
     df['img_tensor'] = df['RGB_image'].apply(
@@ -71,23 +72,32 @@ if __name__ == "__main__":
     ).eval().cuda()
 
     with torch.no_grad():
-        embeddings = model(batch['spectrum'].to('cuda'), input_type='spectrum')
+        embeddings_image = model(batch['image'].to('cuda'), input_type='image')
+    with torch.no_grad():
+        embeddings_spectrum = model(batch['spectrum'].to('cuda'), input_type='spectrum')
+        
+    import torch.nn.functional as F
 
-    for i in range(3):
-        img = batch["image"][i].permute(1, 2, 0).cpu().numpy()
-        flux = batch["spectrum"][i, :, 0].cpu().numpy()
-        wavelength = batch["wavelength"][i].cpu().numpy()
-        mask = wavelength > 0 
 
-        plt.figure(figsize=(8, 4))
-        plt.subplot(1, 2, 1)
+    cos_sim = F.cosine_similarity(embeddings_image, embeddings_spectrum, dim=1)
+
+    cos_sim_np = cos_sim.cpu().numpy()
+
+    print("Cosine similarity: min {:.3f}, max {:.3f}, mean {:.3f}".format(
+        cos_sim_np.min(), cos_sim_np.max(), cos_sim_np.mean()
+    ))
+
+
+    low_sim_idx = cos_sim_np.argsort()[:5]
+
+    print("Indices des paires potentiellement anormales:", low_sim_idx)
+
+    for idx in low_sim_idx:
+        img_tensor = batch['image'][idx].cpu()
+        img = T.ToPILImage()(img_tensor)
+        score = cos_sim_np[idx]
+        plt.figure()
         plt.imshow(img)
-        plt.axis("off")
-
-        plt.subplot(1, 2, 2)
-        plt.plot(wavelength[mask], flux[mask])
-        plt.xlabel("Wavelength")
-        plt.ylabel("Flux")
-        plt.title(f"Redshift: {batch['redshift'][i].item():.3f}")
-        plt.tight_layout()
+        plt.title(f"Cosine similarity (image vs spectrum): {score:.3f}")
+        plt.axis('off')
         plt.show()
