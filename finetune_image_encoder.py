@@ -36,8 +36,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from astroclip.models.astroclip import AstroClipModel, CLIPLoss
+from astroclip.data.datamodule import AstroClipCollator
 from data_pipeline import CACHE_DIR, resolve_parquet_path
-
+from data_pipeline import ParquetDataSource
 
 def zscore_image_tensor(tensor: torch.Tensor) -> torch.Tensor:
     if tensor.ndim != 3:
@@ -53,7 +54,7 @@ class ToTensorZScore:
 
     def __call__(self, image: Image.Image) -> torch.Tensor:
         tensor = self.to_tensor(image)
-        return zscore_image_tensor(tensor)
+        return tensor
 
 
 def set_seed(seed: int) -> None:
@@ -64,34 +65,43 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+from typing import Iterable, Optional
+import pandas as pd
+from data_pipeline import ParquetDataSource
+
 def load_dataframe(
     parquet_paths: Iterable[str],
     max_samples: Optional[int],
     seed: int,
+    focus_high_z: bool = False, batch_size: int = 128,
 ) -> pd.DataFrame:
-    frames: List[pd.DataFrame] = []
-    for parquet_path in parquet_paths:
-        resolved = resolve_parquet_path(parquet_path)
-        frames.append(pd.read_parquet(resolved))
+    frames = []
+    for path in parquet_paths:
+        ds = ParquetDataSource(
+    parquet_path=path,
+    focus_high_z=True,
+    sample_size=max_samples,
+    image_size=144,
+    batch_size=batch_size
+)
+
+        df = ds.load() 
+        frames.append(df)
 
     if not frames:
         raise ValueError("Aucun parquet n'a été chargé. Vérifiez les chemins fournis.")
 
     df = pd.concat(frames, ignore_index=True)
+    print(df.columns)
 
     if max_samples is not None and max_samples < len(df):
         df = df.sample(max_samples, random_state=seed).reset_index(drop=True)
 
-    if "spectrum" not in df.columns:
-        raise ValueError("La colonne 'spectrum' est absente du parquet.")
-
-    if "redshift" not in df.columns:
-        raise ValueError("La colonne 'redshift' est absente du parquet.")
-
-    if "image_bytes" not in df.columns:
-        if "RGB_image" not in df.columns:
-            raise ValueError("Aucune colonne image trouvée ('image_bytes' ou 'RGB_image').")
-        df["image_bytes"] = df["RGB_image"].apply(lambda blob: blob["bytes"])
+    # Vérifie les colonnes critiques
+    required_columns = ["spectrum", "redshift", "image"]
+    for col in required_columns:
+        if col not in df.columns:
+            raise ValueError(f"La colonne '{col}' est absente du DataFrame final.")
 
     return df.reset_index(drop=True)
 
@@ -138,8 +148,8 @@ def build_transforms(
     ]
 
     to_tensor_zscore = ToTensorZScore()
-    train_transform = T.Compose(train_transforms + [to_tensor_zscore])
-    eval_transform = T.Compose(eval_transforms + [to_tensor_zscore])
+    train_transform = T.Compose(train_transforms)
+    eval_transform = T.Compose(eval_transforms)
     return train_transform, eval_transform
 
 
@@ -173,20 +183,11 @@ class AstroClipFineTuneDataset(Dataset):
         return tensor
 
     def _normalise(self, tensor: torch.Tensor) -> torch.Tensor:
-        if self.spectrum_norm == "none":
-            return tensor
-        if self.spectrum_norm == "minmax":
-            min_val = tensor.min()
-            max_val = tensor.max()
-            denom = (max_val - min_val).clamp(min=1e-6)
-            return (tensor - min_val) / denom
-        # Default: z-score
-        mean = tensor.mean()
-        std = tensor.std(unbiased=False).clamp(min=1e-6)
-        return (tensor - mean) / std
+        return tensor
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         row = self.df.iloc[idx]
+        
         spec = row["spectrum"]
         flux = np.asarray(spec["flux"])
         wavelength = spec.get("wavelength")
@@ -195,19 +196,16 @@ class AstroClipFineTuneDataset(Dataset):
         else:
             wavelength = np.asarray(wavelength)
 
-        flux_tensor = self._normalise(self._pad_or_trim(flux))
+        flux_tensor = self._pad_or_trim(flux)
         wavelength_tensor = self._pad_or_trim(wavelength)
-        wavelength_tensor = self._normalise(wavelength_tensor)
+        wavelength_tensor = self._pad_or_trim(wavelength_tensor)
 
         spectrum = flux_tensor.unsqueeze(-1)
         if self.include_wavelength:
             spectrum = torch.stack([flux_tensor, wavelength_tensor], dim=-1)
 
-        image_bytes = row.get("image_bytes")
-        if image_bytes is None:
-            raise ValueError("La colonne 'image_bytes' est absente pour une ligne du DataFrame.")
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        image_tensor = self.image_transform(image)
+        # Plus de transformation ici, l'image est déjà prête
+        image_tensor = row["image"]
 
         return {
             "image": image_tensor,
@@ -311,8 +309,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda", help="Device d'entraînement (cuda ou cpu).")
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--lr", type=float, default=5e-6)
-    parser.add_argument("--weight-decay", type=float, default=5e-2)
+    parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--weight-decay", type=float, default=5e-4)
     parser.add_argument("--slice-length", type=int, default=7700)
     parser.add_argument("--image-size", type=int, default=144)
     parser.add_argument("--max-samples", type=int, default=None)
@@ -336,6 +334,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patience", type=int, default=3, help="Patience pour l'early stopping (epochs).")
     parser.add_argument("--min-delta", type=float, default=1e-4, help="Amélioration minimale requise pour reset la patience.")
     parser.add_argument("--grad-clip", type=float, default=1.0, help="Clip des gradients (<=0 pour désactiver).")
+    parser.add_argument("--accumulate-steps", type=int, default=1, help="Nombre d'itérations pour accumuler les gradients.")
     parser.add_argument("--log-interval", type=int, default=20, help="Intervalle d'affichage des logs (nombre de batchs).")
     parser.add_argument(
         "--unfreeze-backbone-blocks",
@@ -378,6 +377,109 @@ def maybe_unfreeze_backbone(image_encoder: torch.nn.Module, num_blocks: int) -> 
             param.requires_grad = True
     print(f"Dégel de {num_blocks} blocs de la backbone AstroDINO.")
 
+import matplotlib.pyplot as plt
+import random
+
+import matplotlib.pyplot as plt
+import random
+from pathlib import Path
+
+def _img_to_display(img_tensor: torch.Tensor) -> np.ndarray:
+    """
+    img_tensor : torch.Tensor shape (C,H,W) or (H,W,C) on CPU
+    Retourne HxWxC float np.ndarray dans [0,1] prêt pour imshow.
+    """
+    if isinstance(img_tensor, torch.Tensor):
+        img = img_tensor.detach().cpu().numpy()
+    else:
+        img = np.asarray(img_tensor)
+
+    # assure format C,H,W
+    if img.ndim == 3 and img.shape[2] in (1,3):  # H,W,C -> C,H,W
+        img = img.transpose(2, 0, 1)
+
+    if img.ndim == 3:
+        C, H, W = img.shape
+    elif img.ndim == 2:
+        # grayscale H,W -> C,H,W
+        img = img[None, ...]
+        C, H, W = img.shape
+    else:
+        raise ValueError(f"Image shape inattendue pour affichage: {img.shape}")
+
+    # convertir en H,W,C pour matplotlib
+    img_hwc = img.transpose(1, 2, 0).astype(np.float32)
+
+    # Si canaux >3 (rare), coupe aux 3 premiers
+    if img_hwc.shape[2] > 3:
+        img_hwc = img_hwc[..., :3]
+
+    # Min-max per image for display (works for z-score)
+    mn = img_hwc.min()
+    mx = img_hwc.max()
+    img_disp = (img_hwc - mn) / (mx - mn + 1e-6)
+    img_disp = np.clip(img_disp, 0.0, 1.0)
+
+    # If single channel, repeat to 3 channels for nicer display
+    if img_disp.shape[2] == 1:
+        img_disp = np.repeat(img_disp, 3, axis=2)
+
+    return img_disp
+
+
+def visualize_batch(loader: DataLoader, num_samples: int = 3, out_dir: Optional[Path] = None):
+    """
+    Récupère un batch (premier batch of loader), sélectionne num_samples indices aléatoires,
+    sauvegarde des images + spectres dans CACHE_DIR/visuals et affiche leurs chemins.
+    """
+    if out_dir is None:
+        out_dir = Path("/pbs/home/a/astropart27/hackathon2025/AstroCLIP/outputs/")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    batch = next(iter(loader))  # récupère un batch
+    images = batch["image"]     # attendu [B, C, H, W] ou [B, H, W, C]
+    spectra = batch["spectrum"] # attendu [B, L, ...] ou [B, L, C]
+
+    B = images.shape[0]
+    indices = random.sample(range(B), min(num_samples, B))
+
+    saved_paths = []
+    for i, idx in enumerate(indices):
+        # image -> numpy HWC [0,1]
+        img_tensor = images[idx]
+        img_disp = _img_to_display(img_tensor)
+
+        # spectrum -> 1D array (prendre flux si shape (L,1) ou (L,C))
+        spec = spectra[idx]
+        spec_np = spec.detach().cpu().squeeze()
+        if spec_np.ndim > 1:
+            # si spectre a canaux, prends le premier
+            spec_np = spec_np[..., 0]
+        spec_np = np.asarray(spec_np)
+
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+        axes[0].imshow(img_disp)
+        axes[0].set_title(f"Image prétraitée - idx={idx}")
+        axes[0].axis("off")
+
+        axes[1].plot(spec_np)
+        axes[1].set_title("Spectre (flux)")
+        axes[1].set_xlabel("Index")
+        axes[1].set_ylabel("Flux")
+
+        fig.tight_layout()
+        save_path = out_dir / f"sample_{i}_idx{idx}.png"
+        fig.savefig(save_path, dpi=150)
+        plt.close(fig)
+
+        saved_paths.append(save_path)
+
+    print("Visuals saved:")
+    for p in saved_paths:
+        print("  ", p)
+
+    return saved_paths
+
 
 def main() -> None:
     args = parse_args()
@@ -387,7 +489,7 @@ def main() -> None:
     print(f"Utilisation du device: {device}")
 
     print("Chargement du dataset...")
-    df = load_dataframe(args.parquet_paths, args.max_samples, seed=args.seed)
+    df = load_dataframe(args.parquet_paths, args.max_samples, seed=args.seed, batch_size=args.batch_size)
     train_df, val_df = train_val_split(df, args.val_ratio, seed=args.seed)
     print(f"  -> {len(train_df)} exemples pour l'entraînement")
     if val_df is not None:
@@ -411,10 +513,13 @@ def main() -> None:
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
+        collate_fn=AstroClipCollator(),
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
         persistent_workers=args.num_workers > 0,
     )
+    # Visualisation aléatoire sur un batch du train_loader
+    visualize_batch(train_loader, num_samples=3)
 
     val_loader: Optional[DataLoader] = None
     if val_df is not None:
@@ -508,18 +613,37 @@ def main() -> None:
             optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=args.amp and device.type == "cuda"):
                 image_features = image_encoder(images)
+                if global_step % (args.log_interval * 5) == 0:
+                    with torch.no_grad():
+                        img_emb = F.normalize(image_features, dim=-1)
+                        # compute stats
+                        norms = img_emb.norm(dim=-1)
+                        print(f"[DBG] emb mean_norm={image_features.detach().norm(dim=1).mean().item():.4f} std_norm={image_features.detach().norm(dim=1).std().item():.4f}")
+                        # in-batch similarity vs texts
+                        spec_emb = F.normalize(spectrum_features, dim=-1)
+                        sims = img_emb @ spec_emb.t()
+                        top1 = sims.argmax(dim=1)
+                        inbatch_acc = (top1 == torch.arange(sims.size(0), device=top1.device)).float().mean().item()
+                        print(f"[DBG] inbatch_acc={inbatch_acc:.4f} sims_mean={sims.mean().item():.4f} sims_std={sims.std().item():.4f}")
+
+
                 with torch.no_grad():
                     spectrum_features = spectrum_encoder(spectrum)
                 loss = criterion(image_features, spectrum_features, loss_scale)
 
-            scaler.scale(loss).backward()
+            # ==== backward + accumulation ====
+            effective_loss = loss / args.accumulate_steps
+            scaler.scale(effective_loss).backward()
 
-            if args.grad_clip > 0:
-                scaler.unscale_(optimizer)
-                nn_utils.clip_grad_norm_(image_encoder.parameters(), args.grad_clip)
+            # clip only when about to step
+            if batch_idx % args.accumulate_steps == 0 or batch_idx == len(train_loader):
+                if args.grad_clip > 0:
+                    scaler.unscale_(optimizer)
+                    nn_utils.clip_grad_norm_(image_encoder.parameters(), args.grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
 
-            scaler.step(optimizer)
-            scaler.update()
 
             cosine = F.cosine_similarity(
                 F.normalize(image_features.detach(), dim=-1),

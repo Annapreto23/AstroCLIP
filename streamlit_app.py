@@ -250,11 +250,6 @@ def main() -> None:
 
     render_pair_detail(df, embeddings, selected_pair, cfg["slice_length"])
 
-    st.markdown("---")
-    st.markdown(
-        "💡 **Astuce** : la projection PCA met en évidence les clusters de galaxies aux redshifts proches. "
-        "Zoomez/sélectionnez des zones de la figure ou restreignez la plage de redshift pour traquer les paires atypiques."
-    )
 
 
 if __name__ == "__main__":
