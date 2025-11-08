@@ -19,6 +19,14 @@ from huggingface_hub import hf_hub_download, list_repo_files
 from huggingface_hub.utils import EntryNotFoundError
 from torch.utils.data import DataLoader, Dataset
 from sklearn.decomposition import PCA
+import fsspec
+import h5py
+from skimage.exposure import match_histograms
+import torch
+import torch.nn.functional as F
+from PIL import Image
+import io
+import torchvision.transforms as T
 
 from astroclip.data.datamodule import AstroClipCollator
 from astroclip.models import AstroClipModel
@@ -127,7 +135,7 @@ def batch_to_records(batch: Dict[str, Any]) -> List[Dict[str, Any]]:
         target_value = int(target_batch[idx]) if target_batch is not None else -1
 
         image_tensor = batch["image"][idx].float()
-        image_tensor = zscore_image_tensor(image_tensor).cpu()
+        image_tensor = image_tensor.cpu()
 
         records.append(
             {
@@ -184,25 +192,117 @@ class ParquetDataSource(DataSource):
 
     def signature(self) -> str:
         return f"path={self.parquet_path}|focus={self.focus_high_z}"
-
+    def load(self) -> pd.DataFrame:
+        return self._load_impl()
     def _load_impl(self) -> pd.DataFrame:
+
+
+        # ----------------------------
+        # Parameters
+        # ----------------------------
+        patch_size = 144 
+        legacy_ref_idx = 0
+        legacy_image_dataset_url = "https://users.flatironinstitute.org/~flanusse/astroclip_desi.1.1.5.h5"
+
+        # ----------------------------
+        # Load legacy reference image
+        # ----------------------------
+        # with fsspec.open(legacy_image_dataset_url, "rb") as f:
+        #     with h5py.File(f, "r") as h5f:
+        #         for grp_name in sorted(h5f.keys()):
+        #             grp = h5f[grp_name]
+        #             if legacy_ref_idx < len(grp['images']):
+        #                 legacy_ref = np.array(grp['images'][legacy_ref_idx])  # H,W,C
+        #                 break
+        #             else:
+        #                 legacy_ref_idx -= len(grp['images'])
+        # print(f"[OK] Legacy reference image loaded: {legacy_ref.shape}")
+
+        # ----------------------------
+        # Load parquet
+        # ----------------------------
         resolved_path = resolve_parquet_path(self.parquet_path)
         df = pd.read_parquet(resolved_path)
 
-        transform = T.Compose([T.Resize((self.image_size, self.image_size)), T.ToTensor()])
+        transform = T.Compose([
+            T.Resize((self.image_size, self.image_size)),
+            T.ToTensor()
+        ])
+
+        # ----------------------------
+        # Preprocess RGB images
+        # ----------------------------
+        def preprocess_image(blob):
+            img = Image.open(io.BytesIO(blob["bytes"])).convert("RGB")
+            tensor = transform(img)  # (C,H,W)
+
+            # # Resize to multiple of patch_size
+            # H, W = tensor.shape[1], tensor.shape[2]
+            # new_H = (H // patch_size) * patch_size
+            # new_W = (W // patch_size) * patch_size
+            # tensor = F.interpolate(tensor.unsqueeze(0), size=(new_H, new_W), mode='bilinear', align_corners=False).squeeze(0)
+
+            # # Histogram match
+            # img_np = tensor.permute(1,2,0).cpu().numpy()  # H,W,C
+            # img_matched = match_histograms(img_np, legacy_ref, channel_axis=-1)
+            # tensor = torch.from_numpy(img_matched).permute(2,0,1)
+
+            return tensor
 
         if "image" not in df.columns:
-            df["image"] = df["RGB_image"].apply(
-                lambda blob: zscore_image_tensor(
-                    transform(Image.open(io.BytesIO(blob["bytes"])).convert("RGB"))
-                )
-            )
+            df["image"] = df["RGB_image"].apply(preprocess_image)
 
+        # ----------------------------
+        # Dataset-level z-score
+        # ----------------------------
+        # Calcule la moyenne/écart-type globaux sur toutes les images puis applique la même
+        # normalisation à chaque pixel pour reproduire le schéma du papier (z-score global).
+        channel_sum = torch.zeros(3, dtype=torch.float64)
+        channel_sq_sum = torch.zeros(3, dtype=torch.float64)
+        pixel_count = 0
+
+        for tensor in df["image"]:
+            if not isinstance(tensor, torch.Tensor):
+                tensor = torch.as_tensor(tensor, dtype=torch.float32)
+            tensor = tensor.float()
+            channel_sum += tensor.sum(dim=(1, 2))
+            channel_sq_sum += (tensor ** 2).sum(dim=(1, 2))
+            pixel_count += tensor.shape[1] * tensor.shape[2]
+
+        if pixel_count == 0:
+            raise ValueError("Impossible de calculer la normalisation: aucune image disponible.")
+
+        dataset_mean = (channel_sum / pixel_count)
+        dataset_var = (channel_sq_sum / pixel_count) - dataset_mean ** 2
+        dataset_std = torch.sqrt(dataset_var.clamp(min=1e-12))
+
+        dataset_mean = dataset_mean.to(torch.float32)
+        dataset_std = dataset_std.to(torch.float32).clamp(min=1e-6)
+
+        mean_broadcast = dataset_mean[:, None, None]
+        std_broadcast = dataset_std[:, None, None]
+
+        def apply_dataset_zscore(tensor: torch.Tensor) -> torch.Tensor:
+            if not isinstance(tensor, torch.Tensor):
+                tensor = torch.as_tensor(tensor, dtype=torch.float32)
+            tensor = tensor.float()
+            return (tensor - mean_broadcast) / std_broadcast
+
+        df["image"] = df["image"].apply(apply_dataset_zscore)
+
+        # ----------------------------
+        # Check redshift
+        # ----------------------------
         if "redshift" not in df.columns:
+        
             raise ValueError("La colonne 'redshift' est absente du parquet.")
-
+    
         df = df.dropna(subset=["redshift"]).reset_index(drop=True)
 
+        # ----------------------------
+        # Sampling
+        # ----------------------------
+        self.sample_size = len(df)
         if len(df) > self.sample_size:
             if self.focus_high_z:
                 df = df.nlargest(self.sample_size, "redshift").reset_index(drop=True)
@@ -211,6 +311,7 @@ class ParquetDataSource(DataSource):
 
         df["pair_id"] = np.arange(len(df))
         return df
+
 
 
 class StreamingDataSource(DataSource):

@@ -5,6 +5,16 @@ __pycache__/
 
 # C extensions
 *.so
+*.npz
+*.parquet
+*.zip
+*.pt
+*.ckpt
+*.pkl
+
+.hf_cache/
+.cache/
+plot.py
 
 # Distribution / packaging
 .Python
