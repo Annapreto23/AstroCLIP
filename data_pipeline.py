@@ -257,38 +257,38 @@ class ParquetDataSource(DataSource):
         # ----------------------------
         # Calcule la moyenne/écart-type globaux sur toutes les images puis applique la même
         # normalisation à chaque pixel pour reproduire le schéma du papier (z-score global).
-        channel_sum = torch.zeros(3, dtype=torch.float64)
-        channel_sq_sum = torch.zeros(3, dtype=torch.float64)
-        pixel_count = 0
+        # channel_sum = torch.zeros(3, dtype=torch.float64)
+        # channel_sq_sum = torch.zeros(3, dtype=torch.float64)
+        # pixel_count = 0
 
-        for tensor in df["image"]:
-            if not isinstance(tensor, torch.Tensor):
-                tensor = torch.as_tensor(tensor, dtype=torch.float32)
-            tensor = tensor.float()
-            channel_sum += tensor.sum(dim=(1, 2))
-            channel_sq_sum += (tensor ** 2).sum(dim=(1, 2))
-            pixel_count += tensor.shape[1] * tensor.shape[2]
+        # for tensor in df["image"]:
+        #     if not isinstance(tensor, torch.Tensor):
+        #         tensor = torch.as_tensor(tensor, dtype=torch.float32)
+        #     tensor = tensor.float()
+        #     channel_sum += tensor.sum(dim=(1, 2))
+        #     channel_sq_sum += (tensor ** 2).sum(dim=(1, 2))
+        #     pixel_count += tensor.shape[1] * tensor.shape[2]
 
-        if pixel_count == 0:
-            raise ValueError("Impossible de calculer la normalisation: aucune image disponible.")
+        # if pixel_count == 0:
+        #     raise ValueError("Impossible de calculer la normalisation: aucune image disponible.")
 
-        dataset_mean = (channel_sum / pixel_count)
-        dataset_var = (channel_sq_sum / pixel_count) - dataset_mean ** 2
-        dataset_std = torch.sqrt(dataset_var.clamp(min=1e-12))
+        # dataset_mean = (channel_sum / pixel_count)
+        # dataset_var = (channel_sq_sum / pixel_count) - dataset_mean ** 2
+        # dataset_std = torch.sqrt(dataset_var.clamp(min=1e-12))
 
-        dataset_mean = dataset_mean.to(torch.float32)
-        dataset_std = dataset_std.to(torch.float32).clamp(min=1e-6)
+        # dataset_mean = dataset_mean.to(torch.float32)
+        # dataset_std = dataset_std.to(torch.float32).clamp(min=1e-6)
 
-        mean_broadcast = dataset_mean[:, None, None]
-        std_broadcast = dataset_std[:, None, None]
+        # mean_broadcast = dataset_mean[:, None, None]
+        # std_broadcast = dataset_std[:, None, None]
 
-        def apply_dataset_zscore(tensor: torch.Tensor) -> torch.Tensor:
-            if not isinstance(tensor, torch.Tensor):
-                tensor = torch.as_tensor(tensor, dtype=torch.float32)
-            tensor = tensor.float()
-            return (tensor - mean_broadcast) / std_broadcast
+        # def apply_dataset_zscore(tensor: torch.Tensor) -> torch.Tensor:
+        #     if not isinstance(tensor, torch.Tensor):
+        #         tensor = torch.as_tensor(tensor, dtype=torch.float32)
+        #     tensor = tensor.float()
+        #     return (tensor - mean_broadcast) / std_broadcast
 
-        df["image"] = df["image"].apply(apply_dataset_zscore)
+        # df["image"] = df["image"].apply(apply_dataset_zscore)
 
         # ----------------------------
         # Check redshift
@@ -401,7 +401,7 @@ class AstroClipPairDataset(Dataset):
             img_tensor = image_tensor.detach().clone().float()
         else:
             img_tensor = torch.as_tensor(image_tensor, dtype=torch.float32)
-        img_tensor = zscore_image_tensor(img_tensor)
+        img_tensor = img_tensor
 
         redshift = torch.tensor(row["redshift"], dtype=torch.float32)
 

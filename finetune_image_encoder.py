@@ -36,6 +36,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from astroclip.models.astroclip import AstroClipModel, CLIPLoss
+from astroclip.data.datamodule import AstroClipCollator
 from data_pipeline import CACHE_DIR, resolve_parquet_path
 from data_pipeline import ParquetDataSource
 
@@ -147,8 +148,8 @@ def build_transforms(
     ]
 
     to_tensor_zscore = ToTensorZScore()
-    train_transform = T.Compose(train_transforms + [to_tensor_zscore])
-    eval_transform = T.Compose(eval_transforms + [to_tensor_zscore])
+    train_transform = T.Compose(train_transforms)
+    eval_transform = T.Compose(eval_transforms)
     return train_transform, eval_transform
 
 
@@ -308,8 +309,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda", help="Device d'entraînement (cuda ou cpu).")
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--lr", type=float, default=5e-4)
-    parser.add_argument("--weight-decay", type=float, default=5e-2)
+    parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--weight-decay", type=float, default=5e-4)
     parser.add_argument("--slice-length", type=int, default=7700)
     parser.add_argument("--image-size", type=int, default=144)
     parser.add_argument("--max-samples", type=int, default=None)
@@ -379,28 +380,106 @@ def maybe_unfreeze_backbone(image_encoder: torch.nn.Module, num_blocks: int) -> 
 import matplotlib.pyplot as plt
 import random
 
-def visualize_batch(loader: DataLoader, num_samples: int = 3):
-    batch = next(iter(loader))  # récupère un batch
-    images = batch["image"]     # shape [B, C, H, W]
-    spectra = batch["spectrum"] # shape [B, L]
+import matplotlib.pyplot as plt
+import random
+from pathlib import Path
 
-    for _ in range(num_samples):
-        idx = random.randint(0, len(images)-1)
-        
-        img = images[idx].permute(1, 2, 0).cpu().numpy()  # C,H,W -> H,W,C pour imshow
-        spec = spectra[idx].cpu().numpy()
-        
+def _img_to_display(img_tensor: torch.Tensor) -> np.ndarray:
+    """
+    img_tensor : torch.Tensor shape (C,H,W) or (H,W,C) on CPU
+    Retourne HxWxC float np.ndarray dans [0,1] prêt pour imshow.
+    """
+    if isinstance(img_tensor, torch.Tensor):
+        img = img_tensor.detach().cpu().numpy()
+    else:
+        img = np.asarray(img_tensor)
+
+    # assure format C,H,W
+    if img.ndim == 3 and img.shape[2] in (1,3):  # H,W,C -> C,H,W
+        img = img.transpose(2, 0, 1)
+
+    if img.ndim == 3:
+        C, H, W = img.shape
+    elif img.ndim == 2:
+        # grayscale H,W -> C,H,W
+        img = img[None, ...]
+        C, H, W = img.shape
+    else:
+        raise ValueError(f"Image shape inattendue pour affichage: {img.shape}")
+
+    # convertir en H,W,C pour matplotlib
+    img_hwc = img.transpose(1, 2, 0).astype(np.float32)
+
+    # Si canaux >3 (rare), coupe aux 3 premiers
+    if img_hwc.shape[2] > 3:
+        img_hwc = img_hwc[..., :3]
+
+    # Min-max per image for display (works for z-score)
+    mn = img_hwc.min()
+    mx = img_hwc.max()
+    img_disp = (img_hwc - mn) / (mx - mn + 1e-6)
+    img_disp = np.clip(img_disp, 0.0, 1.0)
+
+    # If single channel, repeat to 3 channels for nicer display
+    if img_disp.shape[2] == 1:
+        img_disp = np.repeat(img_disp, 3, axis=2)
+
+    return img_disp
+
+
+def visualize_batch(loader: DataLoader, num_samples: int = 3, out_dir: Optional[Path] = None):
+    """
+    Récupère un batch (premier batch of loader), sélectionne num_samples indices aléatoires,
+    sauvegarde des images + spectres dans CACHE_DIR/visuals et affiche leurs chemins.
+    """
+    if out_dir is None:
+        out_dir = Path("/pbs/home/a/astropart27/hackathon2025/AstroCLIP/outputs/")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    batch = next(iter(loader))  # récupère un batch
+    images = batch["image"]     # attendu [B, C, H, W] ou [B, H, W, C]
+    spectra = batch["spectrum"] # attendu [B, L, ...] ou [B, L, C]
+
+    B = images.shape[0]
+    indices = random.sample(range(B), min(num_samples, B))
+
+    saved_paths = []
+    for i, idx in enumerate(indices):
+        # image -> numpy HWC [0,1]
+        img_tensor = images[idx]
+        img_disp = _img_to_display(img_tensor)
+
+        # spectrum -> 1D array (prendre flux si shape (L,1) ou (L,C))
+        spec = spectra[idx]
+        spec_np = spec.detach().cpu().squeeze()
+        if spec_np.ndim > 1:
+            # si spectre a canaux, prends le premier
+            spec_np = spec_np[..., 0]
+        spec_np = np.asarray(spec_np)
+
         fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-        axes[0].imshow(img)
-        axes[0].set_title("Image RGB prétraitée")
+        axes[0].imshow(img_disp)
+        axes[0].set_title(f"Image prétraitée - idx={idx}")
         axes[0].axis("off")
-        
-        axes[1].plot(spec)
-        axes[1].set_title("Spectre")
-        axes[1].set_xlabel("Pixel/slice")
-        axes[1].set_ylabel("Intensité normalisée")
-        
-        plt.show()
+
+        axes[1].plot(spec_np)
+        axes[1].set_title("Spectre (flux)")
+        axes[1].set_xlabel("Index")
+        axes[1].set_ylabel("Flux")
+
+        fig.tight_layout()
+        save_path = out_dir / f"sample_{i}_idx{idx}.png"
+        fig.savefig(save_path, dpi=150)
+        plt.close(fig)
+
+        saved_paths.append(save_path)
+
+    print("Visuals saved:")
+    for p in saved_paths:
+        print("  ", p)
+
+    return saved_paths
+
 
 def main() -> None:
     args = parse_args()
@@ -434,6 +513,7 @@ def main() -> None:
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
+        collate_fn=AstroClipCollator(),
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
         persistent_workers=args.num_workers > 0,
