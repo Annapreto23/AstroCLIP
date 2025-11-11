@@ -1,4 +1,4 @@
-"""Streamlit visualiser for precomputed AstroCLIP embeddings."""
+"""Streamlit visualiser for precomputed AstroCLIP embeddings (hackathon edition)."""
 
 from __future__ import annotations
 
@@ -11,10 +11,10 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from data_pipeline import approx_distance_mpc
+from hackathon2025.tools.inference import approx_distance_mpc
 
 
-def tensor_to_image(arr: np.ndarray) -> np.ndarray:
+def _tensor_to_image(arr: np.ndarray) -> np.ndarray:
     if arr.ndim != 3:
         raise ValueError(f"Expected CHW array, got shape {arr.shape}")
     if arr.shape[0] in (1, 3):
@@ -22,12 +22,14 @@ def tensor_to_image(arr: np.ndarray) -> np.ndarray:
     raise ValueError(f"Unexpected image channel dimension: {arr.shape[0]}")
 
 
-def load_embeddings(path: Path) -> Tuple[pd.DataFrame, Dict[str, np.ndarray], Dict[str, str]]:
+def _load_embeddings(path: Path) -> Tuple[pd.DataFrame, Dict[str, np.ndarray], Dict[str, str]]:
     with np.load(path, allow_pickle=True) as data:
         payload = {key: data[key] for key in data.files}
 
     metadata_raw = payload.pop("metadata", np.array("{}"))
-    metadata = json.loads(str(metadata_raw.item() if hasattr(metadata_raw, "item") else metadata_raw))
+    if hasattr(metadata_raw, "item"):
+        metadata_raw = metadata_raw.item()
+    metadata = json.loads(str(metadata_raw))
 
     df = pd.DataFrame(
         {
@@ -54,11 +56,11 @@ def load_embeddings(path: Path) -> Tuple[pd.DataFrame, Dict[str, np.ndarray], Di
 
 def main() -> None:
     st.set_page_config(page_title="AstroCLIP Embeddings Viewer", layout="wide")
-    st.title("AstroCLIP Embeddings Viewer")
+    st.title("AstroCLIP Embeddings Viewer (hackathon)")
 
     npz_path = st.text_input("Chemin du fichier embeddings (.npz)", "")
     if not npz_path:
-        st.info("Saisissez un fichier .npz généré via compute_embeddings.py pour commencer.")
+        st.info("Saisissez un fichier .npz généré via l'outil de calcul d'embeddings pour commencer.")
         return
 
     npz_file = Path(npz_path.strip()).expanduser()
@@ -67,7 +69,7 @@ def main() -> None:
         return
 
     try:
-        df, embeddings, metadata = load_embeddings(npz_file)
+        df, embeddings, metadata = _load_embeddings(npz_file)
     except Exception as exc:  # noqa: BLE001
         st.error(f"Impossible de charger le fichier: {exc}")
         return
@@ -122,7 +124,7 @@ def main() -> None:
 
     col1, col2 = st.columns([1, 1.2])
     with col1:
-        st.image(tensor_to_image(image), caption=f"Pair {selected_pair}")
+        st.image(_tensor_to_image(image), caption=f"Pair {selected_pair}")
     with col2:
         spectrum_df = pd.DataFrame({"Wavelength": wavelength, "Flux": flux})
         fig_spec = px.line(spectrum_df, x="Wavelength", y="Flux", title="Spectre")

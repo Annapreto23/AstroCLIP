@@ -1,3 +1,7 @@
+"""Checkpoint utilities for AstroCLIP image encoder weights."""
+
+from __future__ import annotations
+
 import argparse
 from pathlib import Path
 from typing import Dict
@@ -19,9 +23,7 @@ def extract_image_encoder(ckpt_path: str, prefix: str) -> Dict[str, torch.Tensor
     state_dict = checkpoint["state_dict"]
 
     image_state = {
-        key[len(prefix):]: tensor
-        for key, tensor in state_dict.items()
-        if key.startswith(prefix)
+        key[len(prefix) :]: tensor for key, tensor in state_dict.items() if key.startswith(prefix)
     }
 
     if not image_state:
@@ -64,34 +66,42 @@ def merge_into_ckpt(
     print(f"[OK] Nouveau checkpoint sauvegardé dans {out_file}")
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Extrait l'image encoder d'un ckpt et l'injecte dans un autre ckpt."
-    )
-    parser.add_argument("--src-ckpt", required=True, help="Checkpoint source (.ckpt) dont on extrait l'image encoder.")
-    parser.add_argument("--pt-out", required=True, help="Fichier .pt à générer pour stocker l'encodeur image.")
-    parser.add_argument("--target-ckpt", required=True, help="Checkpoint cible dans lequel injecter l'encodeur.")
-    parser.add_argument("--ckpt-out", required=True, help="Checkpoint de sortie combiné.")
-    parser.add_argument(
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Utilitaires pour extraire/injecter l'encodeur image AstroCLIP.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    extract_parser = subparsers.add_parser("extract", help="Extrait l'encodeur image vers un fichier .pt.")
+    extract_parser.add_argument("--src-ckpt", required=True, help="Checkpoint source (.ckpt).")
+    extract_parser.add_argument("--pt-out", required=True, help="Fichier .pt de sortie.")
+    extract_parser.add_argument(
         "--src-prefix",
         default="image_encoder.",
-        help="Préfixe des poids image dans le checkpoint source (ex: 'image_encoder.' ou '' pour un AstroDINO pur).",
+        help="Préfixe des poids image dans le checkpoint source.",
     )
-    parser.add_argument(
+
+    merge_parser = subparsers.add_parser("merge", help="Injecte un encodeur image .pt dans un checkpoint.")
+    merge_parser.add_argument("--pt", required=True, help="Fichier .pt contenant image_encoder_state_dict.")
+    merge_parser.add_argument("--ckpt", required=True, help="Checkpoint cible AstroCLIP (.ckpt).")
+    merge_parser.add_argument("--out", required=True, help="Chemin du checkpoint de sortie.")
+    merge_parser.add_argument(
         "--target-prefix",
         default="image_encoder.",
-        help="Préfixe à utiliser dans le checkpoint cible (par défaut 'image_encoder.').",
+        help="Préfixe à utiliser dans le checkpoint cible.",
     )
-    return parser.parse_args()
+    return parser
 
 
-def main():
-    args = parse_args()
+def main(argv: list[str] | None = None) -> None:
+    parser = _build_parser()
+    args = parser.parse_args(args=argv)
 
-    image_state = extract_image_encoder(args.src_ckpt, prefix=args.src_prefix)
-    save_pt(image_state, args.src_ckpt, args.pt_out)
-    merge_into_ckpt(args.pt_out, args.target_ckpt, args.ckpt_out, target_prefix=args.target_prefix)
-
+    if args.command == "extract":
+        image_state = extract_image_encoder(args.src_ckpt, prefix=args.src_prefix)
+        save_pt(image_state, args.src_ckpt, args.pt_out)
+    elif args.command == "merge":
+        merge_into_ckpt(args.pt, args.ckpt, args.out, target_prefix=args.target_prefix)
+    else:  # pragma: no cover - handled by argparse
+        parser.error("Commande inconnue.")
 
 
 if __name__ == "__main__":

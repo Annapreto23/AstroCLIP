@@ -1,10 +1,11 @@
-"""Data loading and embedding computation utilities for the AstroCLIP Streamlit app."""
+"""High-level helpers to load data and compute AstroCLIP embeddings (hackathon edition)."""
 
 from __future__ import annotations
 
 import hashlib
 import io
 import json
+import os
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -13,57 +14,45 @@ import numpy as np
 import pandas as pd
 import torch
 import torchvision.transforms as T
-from PIL import Image
 from datasets import load_dataset
 from huggingface_hub import hf_hub_download, list_repo_files
 from huggingface_hub.utils import EntryNotFoundError
-from torch.utils.data import DataLoader, Dataset
-from sklearn.decomposition import PCA
-import fsspec
-import h5py
-from skimage.exposure import match_histograms
-import torch
-import torch.nn.functional as F
 from PIL import Image
-import io
-import torchvision.transforms as T
+from sklearn.decomposition import PCA
+from torch.utils.data import DataLoader, Dataset
 
 from astroclip.data.datamodule import AstroClipCollator
 from astroclip.models import AstroClipModel
-from sklearn.decomposition import PCA
 
-ROOT_DIR = Path(__file__).resolve().parent
-CACHE_DIR = ROOT_DIR / "hackathon2025" / ".cache"
+HACKATHON_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_CACHE_DIR = HACKATHON_ROOT / ".cache"
+CACHE_DIR = Path(os.environ.get("ASTROCLIP_CACHE_DIR", DEFAULT_CACHE_DIR))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def zscore_image_tensor(image_tensor: torch.Tensor) -> torch.Tensor:
-    if image_tensor.ndim not in {3, 4}:
-        raise ValueError(f"Image tensor attendu de dimension 3 ou 4, reçu {image_tensor.shape}")
-    if image_tensor.ndim == 4:
-        # Traite un batch complet
-        mean = image_tensor.mean(dim=(2, 3), keepdim=True)
-        std = image_tensor.std(dim=(2, 3), keepdim=True, unbiased=False).clamp(min=1e-6)
-        return (image_tensor - mean) / std
-    mean = image_tensor.mean(dim=(1, 2), keepdim=True)
-    std = image_tensor.std(dim=(1, 2), keepdim=True, unbiased=False).clamp(min=1e-6)
-    return (image_tensor - mean) / std
+    """Apply a per-channel z-score normalisation."""
+    tensor = torch.as_tensor(image_tensor, dtype=torch.float32)
+    if tensor.ndim not in (3, 4):
+        raise ValueError(f"Expected 3D or 4D tensor, got {tensor.shape}")
+    dims = (-1, -2) if tensor.ndim == 4 else (-2, -1)
+    mean = tensor.mean(dim=dims, keepdim=True)
+    std = tensor.std(dim=dims, keepdim=True, unbiased=False).clamp(min=1e-6)
+    return (tensor - mean) / std
 
 
 def _cache_path(prefix: str, **kwargs: Any) -> Path:
-    """Return a deterministic cache file path based on keyword arguments."""
     payload = json.dumps(kwargs, sort_keys=True, default=str).encode("utf-8")
     digest = hashlib.md5(payload).hexdigest()
     return CACHE_DIR / f"{prefix}_{digest}"
 
 
 def resolve_parquet_path(raw_path: str) -> str:
-    """Resolve local or Hugging Face parquet paths to an accessible location."""
+    """Resolve a local or HuggingFace parquet path into a local filename."""
     if not raw_path:
         raise ValueError("Chemin parquet vide.")
 
     raw_path = raw_path.strip()
-
     if raw_path.startswith("hf://"):
         path_no_scheme = raw_path[len("hf://") :]
         if not path_no_scheme.startswith("datasets/"):
@@ -75,7 +64,6 @@ def resolve_parquet_path(raw_path: str) -> str:
 
         repo_id = "/".join(parts[1:3])
         inner_path = "/".join(parts[3:])
-
         try:
             return hf_hub_download(
                 repo_id=repo_id,
@@ -96,19 +84,18 @@ def resolve_parquet_path(raw_path: str) -> str:
 
 
 def batch_to_records(batch: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Convert a batch from the streaming dataloader to a list of dict records."""
+    """Convert a batch from the streaming dataloader into record dictionaries."""
     records: List[Dict[str, Any]] = []
     spec_batch = batch["spectrum"]
-    bsz = batch["image"].shape[0]
-
     target_batch = batch.get("targetid")
-
-    for idx in range(bsz):
+    for idx in range(batch["image"].shape[0]):
         spec_sample = spec_batch[idx]
+        flux: np.ndarray
+        wavelength: np.ndarray
 
         if isinstance(spec_sample, dict):
-            flux = spec_sample["flux"].cpu().numpy()
-            wavelength = spec_sample["wavelength"].cpu().numpy()
+            flux = np.asarray(spec_sample["flux"])
+            wavelength = np.asarray(spec_sample["wavelength"])
         else:
             spec_tensor = torch.as_tensor(spec_sample).cpu()
             if spec_tensor.ndim == 1:
@@ -133,9 +120,7 @@ def batch_to_records(batch: Dict[str, Any]) -> List[Dict[str, Any]]:
                 raise ValueError(f"Spectre NDIM={spec_tensor.ndim} non pris en charge")
 
         target_value = int(target_batch[idx]) if target_batch is not None else -1
-
-        image_tensor = batch["image"][idx].float()
-        image_tensor = image_tensor.cpu()
+        image_tensor = torch.as_tensor(batch["image"][idx]).cpu().float()
 
         records.append(
             {
@@ -145,23 +130,33 @@ def batch_to_records(batch: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "spectrum": {"flux": flux, "wavelength": wavelength},
             }
         )
-
     return records
 
 
 class DataSource(ABC):
     """Abstract loader returning DataFrames with image/spectrum/redshift pairs."""
 
-    def __init__(self, sample_size: int, image_size: int, batch_size: int) -> None:
-        self.sample_size = sample_size
-        self.image_size = image_size
-        self.batch_size = batch_size
+    def __init__(
+        self,
+        sample_size: Optional[int],
+        image_size: int,
+        batch_size: int,
+        enable_cache: bool = True,
+    ) -> None:
+        self.sample_size = int(sample_size) if sample_size is not None else None
+        self.image_size = int(image_size)
+        self.batch_size = int(batch_size)
+        self.enable_cache = enable_cache
 
     def load(self) -> pd.DataFrame:
+        """Load the data frame, optionally using the on-disk cache."""
+        if not self.enable_cache:
+            return self._load_impl()
+
         cache_path = _cache_path(
             "df",
             source=self.__class__.__name__,
-            sample=self.sample_size,
+            sample=self.sample_size if self.sample_size is not None else "all",
             image=self.image_size,
             batch=self.batch_size,
             signature=self.signature(),
@@ -185,125 +180,49 @@ class DataSource(ABC):
 
 
 class ParquetDataSource(DataSource):
-    def __init__(self, parquet_path: str, focus_high_z: bool, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
+    """Load samples from a parquet dataset stored locally or on the Hub."""
+
+    def __init__(
+        self,
+        parquet_path: str,
+        focus_high_z: bool,
+        sample_size: Optional[int],
+        image_size: int,
+        batch_size: int,
+        enable_cache: bool = False,
+    ) -> None:
+        super().__init__(sample_size, image_size, batch_size, enable_cache=enable_cache)
         self.parquet_path = parquet_path
         self.focus_high_z = focus_high_z
+        self._transform = T.Compose(
+            [
+                T.Resize((self.image_size, self.image_size)),
+                T.ToTensor(),
+            ]
+        )
 
     def signature(self) -> str:
         return f"path={self.parquet_path}|focus={self.focus_high_z}"
-    def load(self) -> pd.DataFrame:
-        return self._load_impl()
+
+    def _preprocess_image(self, blob: Dict[str, Any]) -> torch.Tensor:
+        img = Image.open(io.BytesIO(blob["bytes"])).convert("RGB")
+        return self._transform(img)
+
     def _load_impl(self) -> pd.DataFrame:
-
-
-        # ----------------------------
-        # Parameters
-        # ----------------------------
-        patch_size = 144 
-        legacy_ref_idx = 0
-        legacy_image_dataset_url = "https://users.flatironinstitute.org/~flanusse/astroclip_desi.1.1.5.h5"
-
-        # ----------------------------
-        # Load legacy reference image
-        # ----------------------------
-        # with fsspec.open(legacy_image_dataset_url, "rb") as f:
-        #     with h5py.File(f, "r") as h5f:
-        #         for grp_name in sorted(h5f.keys()):
-        #             grp = h5f[grp_name]
-        #             if legacy_ref_idx < len(grp['images']):
-        #                 legacy_ref = np.array(grp['images'][legacy_ref_idx])  # H,W,C
-        #                 break
-        #             else:
-        #                 legacy_ref_idx -= len(grp['images'])
-        # print(f"[OK] Legacy reference image loaded: {legacy_ref.shape}")
-
-        # ----------------------------
-        # Load parquet
-        # ----------------------------
         resolved_path = resolve_parquet_path(self.parquet_path)
         df = pd.read_parquet(resolved_path)
 
-        transform = T.Compose([
-            T.Resize((self.image_size, self.image_size)),
-            T.ToTensor()
-        ])
+        if "image" not in df.columns and "RGB_image" in df.columns:
+            df["image"] = df["RGB_image"].apply(self._preprocess_image)
+        elif "image" not in df.columns:
+            raise ValueError("Le parquet doit contenir une colonne 'image' ou 'RGB_image'.")
 
-        # ----------------------------
-        # Preprocess RGB images
-        # ----------------------------
-        def preprocess_image(blob):
-            img = Image.open(io.BytesIO(blob["bytes"])).convert("RGB")
-            tensor = transform(img)  # (C,H,W)
-
-            # # Resize to multiple of patch_size
-            # H, W = tensor.shape[1], tensor.shape[2]
-            # new_H = (H // patch_size) * patch_size
-            # new_W = (W // patch_size) * patch_size
-            # tensor = F.interpolate(tensor.unsqueeze(0), size=(new_H, new_W), mode='bilinear', align_corners=False).squeeze(0)
-
-            # # Histogram match
-            # img_np = tensor.permute(1,2,0).cpu().numpy()  # H,W,C
-            # img_matched = match_histograms(img_np, legacy_ref, channel_axis=-1)
-            # tensor = torch.from_numpy(img_matched).permute(2,0,1)
-
-            return tensor
-
-        if "image" not in df.columns:
-            df["image"] = df["RGB_image"].apply(preprocess_image)
-
-        # ----------------------------
-        # Dataset-level z-score
-        # ----------------------------
-        # Calcule la moyenne/écart-type globaux sur toutes les images puis applique la même
-        # normalisation à chaque pixel pour reproduire le schéma du papier (z-score global).
-        # channel_sum = torch.zeros(3, dtype=torch.float64)
-        # channel_sq_sum = torch.zeros(3, dtype=torch.float64)
-        # pixel_count = 0
-
-        # for tensor in df["image"]:
-        #     if not isinstance(tensor, torch.Tensor):
-        #         tensor = torch.as_tensor(tensor, dtype=torch.float32)
-        #     tensor = tensor.float()
-        #     channel_sum += tensor.sum(dim=(1, 2))
-        #     channel_sq_sum += (tensor ** 2).sum(dim=(1, 2))
-        #     pixel_count += tensor.shape[1] * tensor.shape[2]
-
-        # if pixel_count == 0:
-        #     raise ValueError("Impossible de calculer la normalisation: aucune image disponible.")
-
-        # dataset_mean = (channel_sum / pixel_count)
-        # dataset_var = (channel_sq_sum / pixel_count) - dataset_mean ** 2
-        # dataset_std = torch.sqrt(dataset_var.clamp(min=1e-12))
-
-        # dataset_mean = dataset_mean.to(torch.float32)
-        # dataset_std = dataset_std.to(torch.float32).clamp(min=1e-6)
-
-        # mean_broadcast = dataset_mean[:, None, None]
-        # std_broadcast = dataset_std[:, None, None]
-
-        # def apply_dataset_zscore(tensor: torch.Tensor) -> torch.Tensor:
-        #     if not isinstance(tensor, torch.Tensor):
-        #         tensor = torch.as_tensor(tensor, dtype=torch.float32)
-        #     tensor = tensor.float()
-        #     return (tensor - mean_broadcast) / std_broadcast
-
-        # df["image"] = df["image"].apply(apply_dataset_zscore)
-
-        # ----------------------------
-        # Check redshift
-        # ----------------------------
         if "redshift" not in df.columns:
-        
             raise ValueError("La colonne 'redshift' est absente du parquet.")
-    
+
         df = df.dropna(subset=["redshift"]).reset_index(drop=True)
 
-        # ----------------------------
-        # Sampling
-        # ----------------------------
-        self.sample_size = len(df)
-        if len(df) > self.sample_size:
+        if self.sample_size is not None and len(df) > self.sample_size:
             if self.focus_high_z:
                 df = df.nlargest(self.sample_size, "redshift").reset_index(drop=True)
             else:
@@ -313,51 +232,51 @@ class ParquetDataSource(DataSource):
         return df
 
 
-
 class StreamingDataSource(DataSource):
+    """Load samples from the official streaming AstroCLIP dataset on HuggingFace."""
+
+    def __init__(self, sample_size: int, image_size: int, batch_size: int, enable_cache: bool = True) -> None:
+        if sample_size is None:
+            raise ValueError("StreamingDataSource requiert un sample_size explicite.")
+        super().__init__(sample_size, image_size, batch_size, enable_cache=enable_cache)
+
     def signature(self) -> str:
-        return "hf_train"
+        return f"hf_train|images={self.image_size}|batch={self.batch_size}"
 
     def _load_impl(self) -> pd.DataFrame:
-        dset = load_dataset("EiffL/AstroCLIP", streaming=True, split="train").with_format("torch")
+        dataset = load_dataset("EiffL/AstroCLIP", streaming=True, split="train").with_format("torch")
         collator = AstroClipCollator(center_crop=self.image_size)
-        loader = DataLoader(
-            dset,
-            batch_size=self.batch_size,
-            collate_fn=collator,
-            drop_last=False,
-        )
+        loader = DataLoader(dataset, batch_size=self.batch_size, collate_fn=collator, drop_last=False)
 
         records: List[Dict[str, Any]] = []
-
         for batch in loader:
             records.extend(batch_to_records(batch))
-            if len(records) >= self.sample_size:
+            if self.sample_size is not None and len(records) >= self.sample_size:
                 break
 
         if not records:
             raise RuntimeError("Impossible de récupérer des exemples depuis le stream Hugging Face.")
 
-        df = pd.DataFrame(records[: self.sample_size])
+        df = pd.DataFrame(records[: self.sample_size] if self.sample_size is not None else records)
         df["pair_id"] = np.arange(len(df))
         return df
 
 
 class AstroClipPairDataset(Dataset):
-    """Dataset qui tronque/pad les spectres et renvoie tenseurs prêts pour AstroCLIP."""
+    """Dataset that pads or trims spectra and returns tensors ready for AstroCLIP."""
 
     def __init__(self, df: pd.DataFrame, slice_length: int = 1024) -> None:
         self.df = df.reset_index(drop=True)
-        self.slice_length = slice_length
+        self.slice_length = int(slice_length)
 
     def __len__(self) -> int:
         return len(self.df)
 
     def _pad_or_trim(self, array: np.ndarray) -> torch.Tensor:
-        tensor = torch.tensor(array, dtype=torch.float32)
+        tensor = torch.as_tensor(array, dtype=torch.float32)
         if tensor.numel() < self.slice_length:
             pad_len = self.slice_length - tensor.numel()
-            tensor = torch.cat([tensor, torch.zeros(pad_len)])
+            tensor = torch.cat([tensor, torch.zeros(pad_len, dtype=torch.float32)])
         else:
             tensor = tensor[: self.slice_length]
         return tensor
@@ -365,7 +284,6 @@ class AstroClipPairDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         row = self.df.iloc[idx]
         spec = row["spectrum"]
-
         if isinstance(spec, dict):
             flux_arr = np.asarray(spec["flux"])
             wave_arr = np.asarray(spec.get("wavelength"))
@@ -397,33 +315,33 @@ class AstroClipPairDataset(Dataset):
         spectrum = flux.unsqueeze(-1)
 
         image_tensor = row["image"]
-        if isinstance(image_tensor, torch.Tensor):
-            img_tensor = image_tensor.detach().clone().float()
-        else:
-            img_tensor = torch.as_tensor(image_tensor, dtype=torch.float32)
-        img_tensor = img_tensor
+        image = image_tensor.detach().clone().float() if isinstance(image_tensor, torch.Tensor) else torch.as_tensor(
+            image_tensor, dtype=torch.float32
+        )
 
         redshift = torch.tensor(row["redshift"], dtype=torch.float32)
-
-        return {
+        sample = {
             "spectrum": spectrum,
-            "image": img_tensor,
+            "image": image,
             "redshift": redshift,
             "wavelength": wave,
         }
+        if "pair_id" in row:
+            sample["pair_id"] = torch.tensor(row["pair_id"], dtype=torch.long)
+        return sample
 
 
 def approx_distance_mpc(redshift: float) -> float:
     """Approximate cosmological distance in Mpc using Hubble law."""
     hubble_km_s_mpc = 70.0
     c_km_s = 299_792.458
-    return (c_km_s / hubble_km_s_mpc) * redshift
+    return (c_km_s / hubble_km_s_mpc) * float(redshift)
 
 
 class EmbeddingComputer:
     """Compute and persist AstroCLIP embeddings for image/spectrum pairs."""
 
-    def __init__(self, checkpoint_path: str, device: str) -> None:
+    def __init__(self, checkpoint_path: str, device: str = "cuda") -> None:
         self.checkpoint_path = checkpoint_path
         self.device = device
         self._model: Optional[AstroClipModel] = None
@@ -474,12 +392,7 @@ class EmbeddingComputer:
         source_signature: str,
         df_len: int,
     ) -> Optional[Dict[str, Any]]:
-        cache_path = self._cache_file(
-            batch_size=batch_size,
-            slice_length=slice_length,
-            source_signature=source_signature,
-            df_len=df_len,
-        )
+        cache_path = self._cache_file(batch_size, slice_length, source_signature, df_len)
         if cache_path.exists():
             cached = np.load(cache_path, allow_pickle=True)
             return {key: cached[key] for key in cached.files}
@@ -492,12 +405,7 @@ class EmbeddingComputer:
         source_signature: str,
         df_len: int,
     ) -> None:
-        cache_path = self._cache_file(
-            batch_size=batch_size,
-            slice_length=slice_length,
-            source_signature=source_signature,
-            df_len=df_len,
-        )
+        cache_path = self._cache_file(batch_size, slice_length, source_signature, df_len)
         if cache_path.exists():
             cache_path.unlink()
 
@@ -507,15 +415,14 @@ class EmbeddingComputer:
         batch_size: int,
         slice_length: int,
         source_signature: str,
+        *,
+        use_cache: bool = True,
+        export_path: Optional[Path | str] = None,
     ) -> Dict[str, Any]:
-        cache_path = self._cache_file(
-            batch_size=batch_size,
-            slice_length=slice_length,
-            source_signature=source_signature,
-            df_len=len(df),
-        )
+        """Compute embeddings and optional PCA projection."""
+        cache_path = self._cache_file(batch_size, slice_length, source_signature, len(df))
 
-        if cache_path.exists():
+        if use_cache and cache_path.exists():
             cached = np.load(cache_path, allow_pickle=True)
             return {key: cached[key] for key in cached.files}
 
@@ -538,9 +445,7 @@ class EmbeddingComputer:
                 image_embeddings = model(image_tensor, input_type="image")
                 spectrum_embeddings = model(spectrum_tensor, input_type="spectrum")
 
-                similarity = torch.nn.functional.cosine_similarity(
-                    image_embeddings, spectrum_embeddings, dim=1
-                )
+                similarity = torch.nn.functional.cosine_similarity(image_embeddings, spectrum_embeddings, dim=1)
 
                 cos_sims.append(similarity.cpu())
                 img_embeds.append(image_embeddings.cpu())
@@ -571,22 +476,17 @@ class EmbeddingComputer:
         }
 
         np.savez_compressed(cache_path, **payload)
+        if export_path is not None:
+            export_path = Path(export_path)
+            export_path.parent.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(export_path, **payload)
         return payload
 
 
 def clear_cache() -> None:
-    """Remove cached DataFrame and embedding artifacts."""
-    for file in CACHE_DIR.glob("*"):
+    """Remove cached DataFrame and embedding artefacts."""
+    if not CACHE_DIR.exists():
+        return
+    for file in CACHE_DIR.glob("**/*"):
         if file.is_file():
             file.unlink()
-
-
-__all__ = [
-    "ParquetDataSource",
-    "StreamingDataSource",
-    "EmbeddingComputer",
-    "approx_distance_mpc",
-    "resolve_parquet_path",
-    "clear_cache",
-    "CACHE_DIR",
-]
